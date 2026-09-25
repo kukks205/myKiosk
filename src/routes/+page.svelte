@@ -1,12 +1,15 @@
 <script>
-  const patient = {
+  const SMARTCARD_READ_URL = 'http://127.0.0.1:8189/api/smartcard/read?readImageFlag=true';
+
+  const defaultPatient = {
     cid: '1234567890123',
     hn: '00458291',
     name: 'สมชาย ใจดี',
     age: '45 ปี',
     gender: 'ชาย',
     phone: '081-234-5678',
-    right: 'สิทธิหลักประกันสุขภาพแห่งชาติ'
+    right: 'สิทธิหลักประกันสุขภาพแห่งชาติ',
+    image: ''
   };
 
   const departments = [
@@ -46,11 +49,146 @@
 
   let currentStep = 1;
   let inputMode = 'card';
+  let patient = { ...defaultPatient };
   let selectedDepartment = departments[0];
   let submittedAt = '';
+  let isReadingCard = false;
+  let cardReadError = '';
 
-  function startRegistration(mode) {
+  function getFirstValue(source, keys, fallback = '') {
+    for (const key of keys) {
+      if (source?.[key] !== undefined && source[key] !== null && `${source[key]}`.trim() !== '') {
+        return `${source[key]}`.trim();
+      }
+    }
+
+    return fallback;
+  }
+
+  function normalizeSmartCardPayload(payload) {
+    const data = payload?.data ?? payload?.result ?? payload?.card ?? payload ?? {};
+    const cid = getFirstValue(data, ['cid', 'pid', 'idCard', 'idcard', 'citizenId', 'CitizenID']);
+    const title = normalizeTitle(getFirstValue(data, ['titleName', 'titleNameTh', 'title', 'prefix', 'prefixName', 'thaiTitleName']));
+    const firstName = getFirstValue(data, ['firstName', 'firstNameTh', 'fname', 'fnameTh', 'name', 'thaiFirstName']);
+    const lastName = getFirstValue(data, ['lastName', 'lastNameTh', 'lname', 'lnameTh', 'surname', 'surnameTh', 'thaiLastName']);
+    const fullName = getFirstValue(data, ['fullName', 'fullNameTh', 'fullname', 'nameTh', 'thaiName']);
+    const birthDate = getFirstValue(data, ['birthDate', 'dob', 'dateOfBirth', 'birthday']);
+    const age = getFirstValue(data, ['age', 'ageText']);
+    const genderValue = getFirstValue(data, ['gender', 'sex'], defaultPatient.gender);
+    const image = getFirstValue(data, ['image', 'photo', 'picture', 'base64Image', 'photoBase64', 'photoJpeg', 'jpegPhoto']);
+    const hn = getFirstValue(data, ['hn', 'HN'], '-');
+    const phone = getFirstValue(data, ['phone', 'telephone', 'mobile'], '-');
+    const right = getFirstValue(data, ['right', 'inscl', 'mainInscl', 'pttypeName'], '-');
+
+    if (!cid) {
+      throw new Error('Smartcard payload does not include CID');
+    }
+
+    return {
+      cid,
+      hn,
+      name: fullName || [title, firstName, lastName].filter(Boolean).join(' ') || defaultPatient.name,
+      age: age || (birthDate ? `${calculateAge(birthDate)} ปี` : defaultPatient.age),
+      gender: normalizeGender(genderValue),
+      phone,
+      right,
+      image: normalizeImage(image)
+    };
+  }
+
+  function normalizeTitle(title) {
+    const titleMap = {
+      '001': 'เด็กชาย',
+      '002': 'เด็กหญิง',
+      '003': 'นาย',
+      '004': 'นางสาว',
+      '005': 'นาง'
+    };
+
+    return titleMap[title] ?? (/^\d+$/.test(title) ? '' : title);
+  }
+
+  function calculateAge(birthDate) {
+    const digits = `${birthDate}`.replace(/\D/g, '');
+    if (digits.length < 8) {
+      return defaultPatient.age.replace(/\D/g, '') || '45';
+    }
+
+    let year = Number(digits.slice(0, 4));
+    const month = Number(digits.slice(4, 6));
+    const day = Number(digits.slice(6, 8));
+
+    if (year > 2400) {
+      year -= 543;
+    }
+
+    const today = new Date();
+    let age = today.getFullYear() - year;
+    const hasHadBirthday = today.getMonth() + 1 > month || (today.getMonth() + 1 === month && today.getDate() >= day);
+
+    if (!hasHadBirthday) {
+      age -= 1;
+    }
+
+    return Number.isFinite(age) && age > 0 ? `${age}` : defaultPatient.age.replace(/\D/g, '') || '45';
+  }
+
+  function normalizeGender(gender) {
+    const value = `${gender}`.trim().toLowerCase();
+
+    if (value === '1' || value === 'm' || value === 'male' || value === 'ชาย') {
+      return 'ชาย';
+    }
+
+    if (value === '2' || value === 'f' || value === 'female' || value === 'หญิง') {
+      return 'หญิง';
+    }
+
+    return gender || defaultPatient.gender;
+  }
+
+  function normalizeImage(image) {
+    if (!image) {
+      return '';
+    }
+
+    return image.startsWith('data:') ? image : `data:image/jpeg;base64,${image}`;
+  }
+
+  async function readSmartCard() {
+    isReadingCard = true;
+    cardReadError = '';
+
+    try {
+      const response = await fetch(SMARTCARD_READ_URL, {
+        method: 'GET',
+        cache: 'no-store'
+      });
+
+      if (!response.ok) {
+        throw new Error(`Smartcard service returned ${response.status}`);
+      }
+
+      const payload = await response.json();
+      patient = normalizeSmartCardPayload(payload);
+      inputMode = 'card';
+      currentStep = 2;
+    } catch (error) {
+      console.error(error);
+      cardReadError = 'ไม่สามารถอ่านข้อมูลจากบัตรประชาชนได้ กรุณาตรวจสอบเครื่องอ่านบัตรและ Smart Card Service';
+    } finally {
+      isReadingCard = false;
+    }
+  }
+
+  async function startRegistration(mode) {
+    if (mode === 'card') {
+      await readSmartCard();
+      return;
+    }
+
     inputMode = mode;
+    patient = { ...defaultPatient };
     currentStep = 2;
   }
 
@@ -65,8 +203,10 @@
   function resetFlow() {
     currentStep = 1;
     inputMode = 'card';
+    patient = { ...defaultPatient };
     selectedDepartment = departments[0];
     submittedAt = '';
+    cardReadError = '';
   }
 </script>
 
@@ -103,20 +243,27 @@
           ระบบจะอ่าน CID จากบัตรประชาชนเพื่อค้นหา HN หรืออ่าน HN จากใบนัด แล้วไปยังหน้าตรวจสอบข้อมูลผู้ป่วย
         </p>
         <div class="start-actions">
-          <button class="primary-action" type="button" on:click={() => startRegistration('card')}>
-            เสียบบัตรประชาชน
+          <button class="primary-action" type="button" disabled={isReadingCard} on:click={() => startRegistration('card')}>
+            {isReadingCard ? 'กำลังอ่านบัตร...' : 'เสียบบัตรประชาชน'}
           </button>
           <button class="secondary-action" type="button" on:click={() => startRegistration('appointment')}>
             แสกนใบนัด
           </button>
         </div>
+        {#if cardReadError}
+          <p class="error-message">{cardReadError}</p>
+        {/if}
       </div>
     </section>
   {:else if currentStep === 2}
     <section class="selection-screen">
       <article class="patient-card">
         <div class="patient-header">
-          <div class="avatar" aria-hidden="true">สจ</div>
+          {#if patient.image}
+            <img class="avatar photo" src={patient.image} alt="รูปจากบัตรประชาชน" />
+          {:else}
+            <div class="avatar" aria-hidden="true">{patient.name.slice(0, 2)}</div>
+          {/if}
           <div>
             <p class="eyebrow">
               {inputMode === 'card' ? 'อ่านข้อมูลจากบัตรประชาชนสำเร็จ' : 'อ่านข้อมูลจากใบนัดสำเร็จ'}
@@ -445,9 +592,26 @@
     width: min(560px, 100%);
   }
 
+  .error-message {
+    max-width: 640px;
+    margin: 18px 0 0;
+    padding: 12px 14px;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    background: #fef2f2;
+    color: #991b1b;
+    font-weight: 800;
+    line-height: 1.5;
+  }
+
   button {
     border-radius: 8px;
     font-weight: 900;
+  }
+
+  button:disabled {
+    cursor: progress;
+    opacity: 0.72;
   }
 
   .primary-action,
@@ -521,6 +685,11 @@
     color: #ffffff;
     font-size: 1.45rem;
     font-weight: 900;
+  }
+
+  .avatar.photo {
+    display: block;
+    object-fit: cover;
   }
 
   .patient-info,
